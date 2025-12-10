@@ -1,0 +1,450 @@
+name: proxmox
+version: v0.1.0
+description: "DevPod provider for Proxmox Virtual Environment"
+icon: https://www.proxmox.com/images/proxmox/Proxmox_symbol_standard_hex_400px.png
+home: https://github.com/yourusername/devpod-provider-proxmox
+
+options:
+  PROXMOX_URL:
+    description: "Proxmox API endpoint URL (e.g., https://proxmox.example.com:8006)"
+    required: true
+    password: false
+    
+  PROXMOX_USER:
+    description: "Proxmox username (e.g., root@pam or user@pve)"
+    required: true
+    default: "root@pam"
+    password: false
+    
+  PROXMOX_PASSWORD:
+    description: "Proxmox password or API token secret"
+    required: true
+    password: true
+    
+  PROXMOX_TOKEN_ID:
+    description: "Proxmox API token ID (optional, use instead of password)"
+    required: false
+    password: false
+    
+  PROXMOX_NODE:
+    description: "Proxmox node name to create VMs on"
+    required: true
+    password: false
+    
+  PROXMOX_STORAGE:
+    description: "Storage pool for VM disks"
+    required: true
+    default: "local-lvm"
+    password: false
+    
+  PROXMOX_BRIDGE:
+    description: "Network bridge for VM networking"
+    required: true
+    default: "vmbr0"
+    password: false
+    
+  VM_TEMPLATE_ID:
+    description: "Template VM ID to clone from (must have cloud-init)"
+    required: true
+    default: "9000"
+    password: false
+    
+  VM_CORES:
+    description: "Number of CPU cores"
+    required: false
+    default: "2"
+    password: false
+    
+  VM_MEMORY:
+    description: "Memory size in MB"
+    required: false
+    default: "4096"
+    password: false
+    
+  VM_DISK_SIZE:
+    description: "Disk size (e.g., 32G, 50G)"
+    required: false
+    default: "32G"
+    password: false
+    
+  VM_SSH_KEY:
+    description: "SSH public key for cloud-init (if not set, uses DevPod's key)"
+    required: false
+    password: false
+    
+  VM_IP_CONFIG:
+    description: "IP configuration (dhcp or ip=192.168.1.100/24,gw=192.168.1.1)"
+    required: false
+    default: "dhcp"
+    password: false
+    
+  VM_NAMESERVER:
+    description: "DNS nameserver for cloud-init"
+    required: false
+    default: "8.8.8.8"
+    password: false
+    
+  VM_SEARCHDOMAIN:
+    description: "DNS search domain"
+    required: false
+    default: ""
+    password: false
+    
+  INSECURE_SKIP_TLS_VERIFY:
+    description: "Skip TLS certificate verification"
+    required: false
+    default: "false"
+    password: false
+    enum:
+      - "true"
+      - "false"
+
+agent:
+  path: /usr/local/bin/devpod-proxmox-provider
+  
+  exec:
+    init: |
+      #!/bin/bash
+      set -e
+      
+      # Initialize Proxmox connection and validate credentials
+      echo "Initializing Proxmox provider..."
+      
+      # Validate required options
+      if [ -z "$PROXMOX_URL" ] || [ -z "$PROXMOX_USER" ] || [ -z "$PROXMOX_NODE" ]; then
+        echo "Error: PROXMOX_URL, PROXMOX_USER, and PROXMOX_NODE are required"
+        exit 1
+      fi
+      
+      # Test connection to Proxmox
+      INSECURE_FLAG=""
+      if [ "$INSECURE_SKIP_TLS_VERIFY" = "true" ]; then
+        INSECURE_FLAG="-k"
+      fi
+      
+      # Determine authentication method
+      if [ -n "$PROXMOX_TOKEN_ID" ]; then
+        AUTH_HEADER="Authorization: PVEAPIToken=${PROXMOX_USER}!${PROXMOX_TOKEN_ID}=${PROXMOX_PASSWORD}"
+      else
+        # Get ticket for password authentication
+        TICKET_RESPONSE=$(curl -s $INSECURE_FLAG -X POST "${PROXMOX_URL}/api2/json/access/ticket" \
+          -d "username=${PROXMOX_USER}" \
+          -d "password=${PROXMOX_PASSWORD}")
+        
+        TICKET=$(echo "$TICKET_RESPONSE" | grep -o '"ticket":"[^"]*"' | cut -d'"' -f4)
+        CSRF_TOKEN=$(echo "$TICKET_RESPONSE" | grep -o '"CSRFPreventionToken":"[^"]*"' | cut -d'"' -f4)
+        
+        if [ -z "$TICKET" ]; then
+          echo "Error: Authentication failed"
+          exit 1
+        fi
+        
+        AUTH_HEADER="Cookie: PVEAuthCookie=${TICKET}"
+      fi
+      
+      # Verify node exists
+      NODE_CHECK=$(curl -s $INSECURE_FLAG "${PROXMOX_URL}/api2/json/nodes/${PROXMOX_NODE}/status" \
+        -H "$AUTH_HEADER")
+      
+      if echo "$NODE_CHECK" | grep -q '"data"'; then
+        echo "Successfully connected to Proxmox node: ${PROXMOX_NODE}"
+      else
+        echo "Error: Could not connect to node ${PROXMOX_NODE}"
+        exit 1
+      fi
+      
+      # Verify template exists
+      TEMPLATE_CHECK=$(curl -s $INSECURE_FLAG "${PROXMOX_URL}/api2/json/nodes/${PROXMOX_NODE}/qemu/${VM_TEMPLATE_ID}/config" \
+        -H "$AUTH_HEADER")
+      
+      if ! echo "$TEMPLATE_CHECK" | grep -q '"data"'; then
+        echo "Warning: Template VM ${VM_TEMPLATE_ID} not found. Please create a cloud-init enabled template."
+      fi
+      
+      echo "Proxmox provider initialized successfully"
+
+    command: |
+      #!/bin/bash
+      set -e
+      
+      INSECURE_FLAG=""
+      if [ "$INSECURE_SKIP_TLS_VERIFY" = "true" ]; then
+        INSECURE_FLAG="-k"
+      fi
+      
+      # Authentication helper
+      get_auth_header() {
+        if [ -n "$PROXMOX_TOKEN_ID" ]; then
+          echo "Authorization: PVEAPIToken=${PROXMOX_USER}!${PROXMOX_TOKEN_ID}=${PROXMOX_PASSWORD}"
+        else
+          TICKET_RESPONSE=$(curl -s $INSECURE_FLAG -X POST "${PROXMOX_URL}/api2/json/access/ticket" \
+            -d "username=${PROXMOX_USER}" \
+            -d "password=${PROXMOX_PASSWORD}")
+          TICKET=$(echo "$TICKET_RESPONSE" | grep -o '"ticket":"[^"]*"' | cut -d'"' -f4)
+          echo "Cookie: PVEAuthCookie=${TICKET}"
+        fi
+      }
+      
+      AUTH_HEADER=$(get_auth_header)
+      
+      # Generate unique VM ID
+      get_next_vmid() {
+        curl -s $INSECURE_FLAG "${PROXMOX_URL}/api2/json/cluster/nextid" \
+          -H "$AUTH_HEADER" | grep -o '"data":[0-9]*' | cut -d':' -f2
+      }
+      
+      # Get VM ID by name
+      get_vmid_by_name() {
+        local name=$1
+        curl -s $INSECURE_FLAG "${PROXMOX_URL}/api2/json/nodes/${PROXMOX_NODE}/qemu" \
+          -H "$AUTH_HEADER" | grep -o "\"vmid\":[0-9]*,\"name\":\"${name}\"" | grep -o '[0-9]*' | head -1
+      }
+      
+      # Wait for task completion
+      wait_for_task() {
+        local upid=$1
+        local max_wait=300
+        local waited=0
+        
+        while [ $waited -lt $max_wait ]; do
+          STATUS=$(curl -s $INSECURE_FLAG "${PROXMOX_URL}/api2/json/nodes/${PROXMOX_NODE}/tasks/${upid}/status" \
+            -H "$AUTH_HEADER" | grep -o '"status":"[^"]*"' | cut -d'"' -f4)
+          
+          if [ "$STATUS" = "stopped" ]; then
+            EXITSTATUS=$(curl -s $INSECURE_FLAG "${PROXMOX_URL}/api2/json/nodes/${PROXMOX_NODE}/tasks/${upid}/status" \
+              -H "$AUTH_HEADER" | grep -o '"exitstatus":"[^"]*"' | cut -d'"' -f4)
+            
+            if [ "$EXITSTATUS" = "OK" ]; then
+              return 0
+            else
+              echo "Task failed with status: $EXITSTATUS"
+              return 1
+            fi
+          fi
+          
+          sleep 5
+          waited=$((waited + 5))
+        done
+        
+        echo "Task timeout"
+        return 1
+      }
+      
+      # Get VM IP address
+      get_vm_ip() {
+        local vmid=$1
+        local max_wait=120
+        local waited=0
+        
+        while [ $waited -lt $max_wait ]; do
+          IP=$(curl -s $INSECURE_FLAG "${PROXMOX_URL}/api2/json/nodes/${PROXMOX_NODE}/qemu/${vmid}/agent/network-get-interfaces" \
+            -H "$AUTH_HEADER" 2>/dev/null | grep -o '"ip-address":"[0-9.]*"' | head -1 | cut -d'"' -f4)
+          
+          if [ -n "$IP" ] && [ "$IP" != "127.0.0.1" ]; then
+            echo "$IP"
+            return 0
+          fi
+          
+          sleep 5
+          waited=$((waited + 5))
+        done
+        
+        echo "Could not determine VM IP address"
+        return 1
+      }
+      
+      case "$1" in
+        create)
+          VM_NAME="${DEVPOD_MACHINE_ID}"
+          VMID=$(get_next_vmid)
+          
+          echo "Creating VM ${VM_NAME} with ID ${VMID}..."
+          
+          # Clone from template
+          CLONE_RESPONSE=$(curl -s $INSECURE_FLAG -X POST \
+            "${PROXMOX_URL}/api2/json/nodes/${PROXMOX_NODE}/qemu/${VM_TEMPLATE_ID}/clone" \
+            -H "$AUTH_HEADER" \
+            -H "Content-Type: application/x-www-form-urlencoded" \
+            -d "newid=${VMID}" \
+            -d "name=${VM_NAME}" \
+            -d "full=1" \
+            -d "storage=${PROXMOX_STORAGE}")
+          
+          UPID=$(echo "$CLONE_RESPONSE" | grep -o '"data":"[^"]*"' | cut -d'"' -f4)
+          
+          if [ -n "$UPID" ]; then
+            wait_for_task "$UPID"
+          fi
+          
+          # Configure VM
+          echo "Configuring VM..."
+          
+          SSH_KEY="${VM_SSH_KEY}"
+          if [ -z "$SSH_KEY" ]; then
+            SSH_KEY=$(cat ~/.ssh/devpod.pub 2>/dev/null || echo "")
+          fi
+          
+          CONFIG_DATA="cores=${VM_CORES}&memory=${VM_MEMORY}"
+          
+          if [ -n "$SSH_KEY" ]; then
+            CONFIG_DATA="${CONFIG_DATA}&sshkeys=$(echo "$SSH_KEY" | sed 's/ /%20/g')"
+          fi
+          
+          if [ "$VM_IP_CONFIG" != "dhcp" ]; then
+            CONFIG_DATA="${CONFIG_DATA}&ipconfig0=${VM_IP_CONFIG}"
+          else
+            CONFIG_DATA="${CONFIG_DATA}&ipconfig0=ip=dhcp"
+          fi
+          
+          CONFIG_DATA="${CONFIG_DATA}&nameserver=${VM_NAMESERVER}"
+          
+          if [ -n "$VM_SEARCHDOMAIN" ]; then
+            CONFIG_DATA="${CONFIG_DATA}&searchdomain=${VM_SEARCHDOMAIN}"
+          fi
+          
+          curl -s $INSECURE_FLAG -X PUT \
+            "${PROXMOX_URL}/api2/json/nodes/${PROXMOX_NODE}/qemu/${VMID}/config" \
+            -H "$AUTH_HEADER" \
+            -H "Content-Type: application/x-www-form-urlencoded" \
+            -d "$CONFIG_DATA"
+          
+          # Resize disk if needed
+          if [ "$VM_DISK_SIZE" != "32G" ]; then
+            curl -s $INSECURE_FLAG -X PUT \
+              "${PROXMOX_URL}/api2/json/nodes/${PROXMOX_NODE}/qemu/${VMID}/resize" \
+              -H "$AUTH_HEADER" \
+              -d "disk=scsi0" \
+              -d "size=${VM_DISK_SIZE}"
+          fi
+          
+          echo "VM created successfully with ID: ${VMID}"
+          ;;
+          
+        start)
+          VM_NAME="${DEVPOD_MACHINE_ID}"
+          VMID=$(get_vmid_by_name "$VM_NAME")
+          
+          if [ -z "$VMID" ]; then
+            echo "Error: VM not found"
+            exit 1
+          fi
+          
+          echo "Starting VM ${VMID}..."
+          
+          START_RESPONSE=$(curl -s $INSECURE_FLAG -X POST \
+            "${PROXMOX_URL}/api2/json/nodes/${PROXMOX_NODE}/qemu/${VMID}/status/start" \
+            -H "$AUTH_HEADER")
+          
+          UPID=$(echo "$START_RESPONSE" | grep -o '"data":"[^"]*"' | cut -d'"' -f4)
+          
+          if [ -n "$UPID" ]; then
+            wait_for_task "$UPID"
+          fi
+          
+          echo "VM started successfully"
+          ;;
+          
+        stop)
+          VM_NAME="${DEVPOD_MACHINE_ID}"
+          VMID=$(get_vmid_by_name "$VM_NAME")
+          
+          if [ -z "$VMID" ]; then
+            echo "Error: VM not found"
+            exit 1
+          fi
+          
+          echo "Stopping VM ${VMID}..."
+          
+          STOP_RESPONSE=$(curl -s $INSECURE_FLAG -X POST \
+            "${PROXMOX_URL}/api2/json/nodes/${PROXMOX_NODE}/qemu/${VMID}/status/shutdown" \
+            -H "$AUTH_HEADER")
+          
+          UPID=$(echo "$STOP_RESPONSE" | grep -o '"data":"[^"]*"' | cut -d'"' -f4)
+          
+          if [ -n "$UPID" ]; then
+            wait_for_task "$UPID"
+          fi
+          
+          echo "VM stopped successfully"
+          ;;
+          
+        delete)
+          VM_NAME="${DEVPOD_MACHINE_ID}"
+          VMID=$(get_vmid_by_name "$VM_NAME")
+          
+          if [ -z "$VMID" ]; then
+            echo "VM not found, nothing to delete"
+            exit 0
+          fi
+          
+          echo "Deleting VM ${VMID}..."
+          
+          # Stop VM first if running
+          curl -s $INSECURE_FLAG -X POST \
+            "${PROXMOX_URL}/api2/json/nodes/${PROXMOX_NODE}/qemu/${VMID}/status/stop" \
+            -H "$AUTH_HEADER" 2>/dev/null
+          
+          sleep 5
+          
+          DELETE_RESPONSE=$(curl -s $INSECURE_FLAG -X DELETE \
+            "${PROXMOX_URL}/api2/json/nodes/${PROXMOX_NODE}/qemu/${VMID}" \
+            -H "$AUTH_HEADER" \
+            -d "purge=1")
+          
+          UPID=$(echo "$DELETE_RESPONSE" | grep -o '"data":"[^"]*"' | cut -d'"' -f4)
+          
+          if [ -n "$UPID" ]; then
+            wait_for_task "$UPID"
+          fi
+          
+          echo "VM deleted successfully"
+          ;;
+          
+        status)
+          VM_NAME="${DEVPOD_MACHINE_ID}"
+          VMID=$(get_vmid_by_name "$VM_NAME")
+          
+          if [ -z "$VMID" ]; then
+            echo "NotFound"
+            exit 0
+          fi
+          
+          STATUS=$(curl -s $INSECURE_FLAG \
+            "${PROXMOX_URL}/api2/json/nodes/${PROXMOX_NODE}/qemu/${VMID}/status/current" \
+            -H "$AUTH_HEADER" | grep -o '"status":"[^"]*"' | cut -d'"' -f4)
+          
+          case "$STATUS" in
+            running)
+              echo "Running"
+              ;;
+            stopped)
+              echo "Stopped"
+              ;;
+            *)
+              echo "Unknown"
+              ;;
+          esac
+          ;;
+          
+        ip)
+          VM_NAME="${DEVPOD_MACHINE_ID}"
+          VMID=$(get_vmid_by_name "$VM_NAME")
+          
+          if [ -z "$VMID" ]; then
+            echo "Error: VM not found"
+            exit 1
+          fi
+          
+          get_vm_ip "$VMID"
+          ;;
+          
+        *)
+          echo "Unknown command: $1"
+          exit 1
+          ;;
+      esac
+
+    delete: |
+      #!/bin/bash
+      # Cleanup is handled by the delete command
+      echo "Provider cleanup complete"
